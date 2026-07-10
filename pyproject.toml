@@ -1,6 +1,6 @@
 [project]
 name = "cosmos-xenna"
-version = "0.5.1"
+version = "0.5.2"
 description = "A framework for building and running distributed, AI-powered data pipelines using Ray"
 readme = "README.md"
 license = { file = "LICENSE" }
@@ -47,6 +47,11 @@ dev = [
 
 [tool.uv]
 default-groups = ["dev", "examples", "gpu"]
+environments = [
+    "sys_platform == 'linux' and platform_machine == 'x86_64'",
+    "sys_platform == 'linux' and platform_machine == 'aarch64'",
+    "sys_platform == 'darwin' and platform_machine == 'arm64'",
+]
 
 [build-system]
 requires = ["maturin>=1.0,<2.0"]
