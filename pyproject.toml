@@ -24,8 +24,11 @@ gpu = ["gpustat", "pynvml"]
 examples = [
     "huggingface-hub>=0.30.2",
     "requests>=2.32.3",
-    "torch>=2.6.0",
-    "torchvision>=0.21.0",
+    # Pin to the cu128 build range: torch 2.8.x ships CUDA 12.8 wheels with
+    # Blackwell (sm_120) kernels, matching this machine's CUDA 12.8 driver.
+    # torch >=2.10 defaults to cu130 wheels, which require a newer NVIDIA driver.
+    "torch>=2.8.0,<2.9.0",
+    "torchvision>=0.23.0,<0.24.0",
     "transformers>=4.51.3",
 ]
 
@@ -52,6 +55,15 @@ environments = [
     "sys_platform == 'linux' and platform_machine == 'aarch64'",
     "sys_platform == 'darwin' and platform_machine == 'arm64'",
 ]
+
+# Use the Tsinghua (TUNA) PyPI mirror as the default index for fast downloads in China.
+# Since torch 2.8.0 the default PyPI wheels are built against CUDA 12.8 (cu128) and
+# ship kernels for Blackwell GPUs (sm_120, e.g. RTX 50-series), so no special PyTorch
+# index is needed -- the mirror serves the correct GPU-enabled wheels directly.
+[[tool.uv.index]]
+name = "tuna"
+url = "https://pypi.tuna.tsinghua.edu.cn/simple"
+default = true
 
 [build-system]
 requires = ["maturin>=1.0,<2.0"]
