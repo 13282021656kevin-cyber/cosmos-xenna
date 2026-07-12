@@ -192,3 +192,8 @@ cython_debug/
 #  refer to https://docs.cursor.com/context/ignore-files
 .cursorignore
 .cursorindexingignore
+
+# Profiling artifacts (cargo flamegraph / perf)
+flamegraph*.svg
+perf.data
+perf.data.old

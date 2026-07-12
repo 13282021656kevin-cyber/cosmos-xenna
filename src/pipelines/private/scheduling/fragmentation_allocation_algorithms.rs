@@ -307,6 +307,14 @@ pub fn find_possible_allocations_on_node(
 struct ScratchView<'a> {
     node: &'a rds::NodeResources,
     effective_used: Vec<rds::FixedUtil>,
+    /// `f32` mirror of `effective_used`, kept in lockstep. The fragmentation scoring hot loop
+    /// sums `(1 - used)` across GPUs once per workload stage per candidate; doing that on `f32`
+    /// avoids the expensive `FixedUtil::to_num::<f32>()` conversion that otherwise dominated the
+    /// profile. `effective_used` (fixed) remains the source of truth for allocation feasibility.
+    effective_used_f32: Vec<f32>,
+    /// The node's base GPU usage in `f32`, so `reset` can restore the mirror with a plain
+    /// `copy_from_slice` (no per-GPU conversion) instead of reconverting from fixed each time.
+    base_used_f32: Vec<f32>,
     effective_used_cpus: rds::FixedUtil,
 }
 
@@ -314,9 +322,18 @@ impl<'a> ScratchView<'a> {
     /// Build a view of `node` with no overlay applied.
     #[inline]
     fn from_node(node: &'a rds::NodeResources) -> Self {
+        let effective_used: Vec<rds::FixedUtil> =
+            node.gpus.iter().map(|g| g.used_fraction).collect();
+        let base_used_f32: Vec<f32> = node
+            .gpus
+            .iter()
+            .map(|g| g.used_fraction.to_num::<f32>())
+            .collect();
         Self {
             node,
-            effective_used: node.gpus.iter().map(|g| g.used_fraction).collect(),
+            effective_used,
+            effective_used_f32: base_used_f32.clone(),
+            base_used_f32,
             effective_used_cpus: node.used_cpus,
         }
     }
@@ -327,6 +344,8 @@ impl<'a> ScratchView<'a> {
         for (slot, gpu) in self.effective_used.iter_mut().zip(self.node.gpus.iter()) {
             *slot = gpu.used_fraction;
         }
+        // Cheap restore of the f32 mirror: copy the precomputed base, no fixed->float conversion.
+        self.effective_used_f32.copy_from_slice(&self.base_used_f32);
         self.effective_used_cpus = self.node.used_cpus;
     }
 
@@ -335,7 +354,10 @@ impl<'a> ScratchView<'a> {
     fn apply_allocate(&mut self, alloc: &rds::WorkerResources) {
         self.effective_used_cpus += alloc.cpus;
         for gpu_alloc in &alloc.gpus {
-            self.effective_used[gpu_alloc.offset] += gpu_alloc.used_fraction;
+            let slot = gpu_alloc.offset;
+            self.effective_used[slot] += gpu_alloc.used_fraction;
+            // Recompute the mirror from the fixed source of truth so the two never drift.
+            self.effective_used_f32[slot] = self.effective_used[slot].to_num::<f32>();
         }
     }
 
@@ -344,7 +366,9 @@ impl<'a> ScratchView<'a> {
     fn apply_release(&mut self, alloc: &rds::WorkerResources) {
         self.effective_used_cpus -= alloc.cpus;
         for gpu_alloc in &alloc.gpus {
-            self.effective_used[gpu_alloc.offset] -= gpu_alloc.used_fraction;
+            let slot = gpu_alloc.offset;
+            self.effective_used[slot] -= gpu_alloc.used_fraction;
+            self.effective_used_f32[slot] = self.effective_used[slot].to_num::<f32>();
         }
     }
 
@@ -404,10 +428,7 @@ impl<'a> ScratchView<'a> {
     /// Sum of `(1 - used)` across all GPUs.
     #[inline]
     fn total_available_gpus(&self) -> f32 {
-        self.effective_used
-            .iter()
-            .map(|u| 1.0 - u.to_num::<f32>())
-            .sum()
+        self.effective_used_f32.iter().map(|&u| 1.0 - u).sum()
     }
 
     /// `f32` mirror of `NodeResources::free_pool().total_num()` (free CPUs + free GPU compute).
@@ -421,14 +442,24 @@ impl<'a> ScratchView<'a> {
     #[inline]
     fn used_pool_total_num(&self) -> f32 {
         let used_cpus = self.effective_used_cpus.to_num::<f32>();
-        let used_gpus: f32 = self.effective_used.iter().map(|u| u.to_num::<f32>()).sum();
+        let used_gpus: f32 = self.effective_used_f32.iter().sum();
         used_cpus + used_gpus
     }
 
     /// Calculates GPU resources that cannot be allocated to `shape` given the effective state.
+    #[cfg_attr(not(test), allow(dead_code))] // retained as a stable entry point for tests
     fn unallocatable_gpus_for_shape(&self, shape: &rds::WorkerShape) -> f32 {
-        let total_available_gpus = self.total_available_gpus();
+        self.unallocatable_gpus_for_shape_with_total(shape, self.total_available_gpus())
+    }
 
+    /// Same as [`unallocatable_gpus_for_shape`] but with `total_available_gpus` precomputed by the
+    /// caller. `estimate_fragmentation` evaluates every workload stage against the *same* node
+    /// state, so the total-available sum is identical across stages and is hoisted out of the loop.
+    fn unallocatable_gpus_for_shape_with_total(
+        &self,
+        shape: &rds::WorkerShape,
+        total_available_gpus: f32,
+    ) -> f32 {
         if let rds::WorkerShape::CpuOnly(_) = shape {
             return total_available_gpus;
         }
@@ -437,9 +468,9 @@ impl<'a> ScratchView<'a> {
         }
 
         let mut out = 0.0;
-        for &used in &self.effective_used {
+        for (&used, &used_f32) in self.effective_used.iter().zip(self.effective_used_f32.iter()) {
             if !gpu_can_be_used_to_allocate_inner(used, shape) {
-                out += 1.0 - used.to_num::<f32>();
+                out += 1.0 - used_f32;
             }
         }
         out
@@ -447,9 +478,13 @@ impl<'a> ScratchView<'a> {
 
     /// Estimated fragmentation across the whole workload, weighted by stage frequency.
     fn estimate_fragmentation(&self, workload: &Workload) -> f32 {
+        // `total_available_gpus` does not depend on the shape, so compute it once instead of
+        // recomputing it inside `unallocatable_gpus_for_shape` for every stage.
+        let total_available_gpus = self.total_available_gpus();
         let mut out = 0.0;
         for stage in &workload.stages {
-            out += stage.frequency * self.unallocatable_gpus_for_shape(&stage.shape);
+            out += stage.frequency
+                * self.unallocatable_gpus_for_shape_with_total(&stage.shape, total_available_gpus);
         }
         out
     }
