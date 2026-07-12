@@ -29,6 +29,7 @@ import attrs
 from cosmos_xenna import file_distribution
 from cosmos_xenna.pipelines.private import resources
 from cosmos_xenna.pipelines.private.continuous_wrapped_stage import ContinuousWrappedStage
+from cosmos_xenna.pipelines.private.queue_interface import PayloadCodec, StageQueue
 from cosmos_xenna.pipelines.private.scheduling_py.saturation_aware.config import (
     SaturationAwareConfig as SaturationAwareConfig,
 )
@@ -459,6 +460,17 @@ class StreamingSpecificSpec:
     # Tunables for the saturation-aware scheduler; consulted only when
     # ``scheduler`` is ``SATURATION_AWARE``. ``None`` uses the defaults.
     saturation_aware: SaturationAwareConfig | None = None
+    # Pluggable queue backend. A zero-arg factory returning a fresh
+    # :class:`~cosmos_xenna.pipelines.private.queue_interface.StageQueue` for
+    # each per-stage queue (and the pipeline input queue). ``None`` uses the
+    # in-memory, object-ref backend. Supply a factory to swap in a different
+    # ordering/locality/durable backend without touching the scheduler.
+    queue_factory: typing.Callable[[], StageQueue] | None = None
+    # Pluggable payload materialisation boundary. A zero-arg factory returning a
+    # :class:`~cosmos_xenna.pipelines.private.queue_interface.PayloadCodec`.
+    # ``None`` uses the Ray object store. Swap together with ``queue_factory``
+    # to persist payloads outside the object store.
+    payload_codec_factory: typing.Callable[[], PayloadCodec] | None = None
 
 
 @attrs.define

@@ -23,7 +23,7 @@ import queue as python_queue
 import random
 import time
 import typing
-from typing import Optional
+from typing import Any, Optional
 
 import attrs
 import ray
@@ -37,6 +37,7 @@ from cosmos_xenna.pipelines.private import (
     resources,
     specs,
 )
+from cosmos_xenna.pipelines.private.queue_interface import Batch, PayloadCodec, StageQueue
 from cosmos_xenna.pipelines.private.scheduling_py import runtime_signals
 from cosmos_xenna.pipelines.private.scheduling_py.saturation_aware.config import SaturationAwareConfig
 from cosmos_xenna.pipelines.private.scheduling_py.saturation_aware.scheduler import SaturationAwareScheduler
@@ -768,28 +769,37 @@ def _verify_enough_resources(pipeline_spec: specs.PipelineSpec, cluster_resource
         )
 
 
-class Queue:
-    """
-    A queue that stores Ray ObjectRefs, organized by the originating node ID.
-    It allows retrieving batches of items, attempting to pull items evenly
-    across nodes.
+class InMemoryStageQueue:
+    """In-memory :class:`StageQueue` backend, organized by originating node ID.
+
+    Stores opaque handles (``ray.ObjectRef`` in practice) in per-node deques and
+    pulls batches by shuffling across nodes, so work is spread evenly while
+    preserving data-locality hints. Reads are *destructive* ("take == consume"),
+    so :attr:`supports_ack` is ``False`` and ``ack``/``nack`` are no-ops.
+
+    This is a pure refactor of the former ``Queue`` class: the locality-aware
+    batching logic is unchanged; only the public API now conforms to
+    :class:`~cosmos_xenna.pipelines.private.queue_interface.StageQueue`.
     """
 
-    def __init__(self, samples_per_task_window: int = 100) -> None:
-        """
-        Initializes the Queue.
+    # Destructive-read backend: a batch is consumed the moment it is returned by
+    # ``try_get_batch``, so there is nothing to ack/nack.
+    supports_ack: bool = False
+
+    def __init__(self, samples_per_batch_window: int = 100) -> None:
+        """Initialize the queue.
 
         Args:
-            samples_per_task_window: The maximum number of task sample counts
-                                     to store for calculating the average.
+            samples_per_batch_window: The maximum number of recent batch sample
+                counts to retain for computing the rolling average.
         """
-        # Stores deques of ObjectRefs, keyed by the node ID they originated from.
-        # A key of None might be used if the origin node is unknown.
-        self.by_node_id: collections.defaultdict[Optional[str], collections.deque[ray.ObjectRef]] = (
-            collections.defaultdict(collections.deque)
+        # Deques of handles, keyed by the node ID they originated from.
+        # A key of None is used when the origin node is unknown.
+        self._by_node_id: collections.defaultdict[Optional[str], collections.deque[Any]] = collections.defaultdict(
+            collections.deque
         )
-        # Stores the number of samples added in recent tasks to calculate an average.
-        self._samples_per_task: collections.deque[int] = collections.deque(maxlen=samples_per_task_window)
+        # Recent per-batch sample counts, used to compute a rolling average.
+        self._samples_per_batch: collections.deque[int] = collections.deque(maxlen=samples_per_batch_window)
 
     def __bool__(self) -> bool:
         """Returns True if the queue contains any items, False otherwise."""
@@ -797,77 +807,71 @@ class Queue:
 
     def __len__(self) -> int:
         """Returns the total number of items across all node queues."""
-        return sum(len(q) for q in self.by_node_id.values())
+        return sum(len(q) for q in self._by_node_id.values())
 
-    def avg_samples_per_task(self) -> Optional[float]:
-        """
-        Calculates the average number of samples added per task, based on the
-        recent history defined by samples_per_task_window.
+    def avg_samples_per_batch(self) -> Optional[float]:
+        """Rolling average of samples-per-batch over recent writes, or ``None``.
 
         Returns:
-            The average number of samples per task, or None if no tasks have
-            been added yet.
+            The average number of samples per batch, or None if nothing has
+            been written yet.
         """
-        if not self._samples_per_task:
+        if not self._samples_per_batch:
             return None
-        return sum(self._samples_per_task) / len(self._samples_per_task)
+        return sum(self._samples_per_batch) / len(self._samples_per_batch)
 
-    def add_task(self, task: actor_pool.Task) -> None:
-        """
-        Adds all ObjectRefs from a Task to the queue, organizing them by the
-        task's origin node ID. Also records the number of samples in the task.
+    def put(self, batch: Batch) -> None:
+        """Append a batch of handles, keyed by its origin node ID.
 
-        Args:
-            task: The Task object containing ObjectRefs and origin node ID.
+        Also records the batch's sample count for the rolling average.
         """
-        node_queue = self.by_node_id[task.origin_node_id]
+        node_queue = self._by_node_id[batch.origin_node_id]
         count = 0
-        for ref in task.task_data:
+        for ref in batch.items:
             node_queue.append(ref)
             count += 1
 
         # Only record if samples were actually added
         if count > 0:
-            self._samples_per_task.append(count)
+            self._samples_per_batch.append(count)
 
     # TODO: Prefer to pull items from nodes that have enough samples to fill the batch.
-    def maybe_get_batch(self, stage_batch_size: int) -> Optional[actor_pool.Task]:
-        """
-        Attempts to retrieve a batch of a specific size from the queue.
+    def try_get_batch(self, size: int) -> Optional[Batch]:
+        """Pull ``size`` samples as one batch, spread across nodes.
 
-        It shuffles the nodes and then iterates through them, pulling items. It will pull fully from a node before
-        moving on to the next.
+        Shuffles the nodes and iterates through them, pulling items and fully
+        draining a node before moving on. Returns ``None`` when fewer than
+        ``size`` samples are available.
 
         Args:
-            stage_batch_size: The desired number of items in the batch.
+            size: The desired number of items in the batch.
 
         Returns:
-            A Task object containing the batch of items and the most frequent
-            origin node ID among the batch items, or None if the queue doesn't
-            have enough items to form a full batch.
+            A :class:`Batch` containing the items and the most frequent origin
+            node ID among them, or ``None`` if a full batch cannot be formed.
 
         Raises:
-            ValueError: If stage_batch_size is not positive.
+            ValueError: If ``size`` is not positive.
         """
-        if stage_batch_size <= 0:
+        if size <= 0:
             raise ValueError("Batch size must be greater than 0")
         # Check if there are enough total items before starting
-        if len(self) < stage_batch_size:
+        if len(self) < size:
             return None
 
-        vals: list[ray.ObjectRef] = []
+        vals: list[Any] = []
         node_ids_in_batch: list[Optional[str]] = []
 
         # Get node IDs that currently have items
         # Shuffle to avoid consistently prioritizing the same nodes
-        active_node_ids = [nid for nid, queue in self.by_node_id.items() if queue]
+        active_node_ids = [nid for nid, queue in self._by_node_id.items() if queue]
         random.shuffle(active_node_ids)  # Shuffle for better distribution
 
         # Keep track of nodes that become empty during this batch retrieval
         emptied_nodes = set()
 
         # Loop until the batch is full
-        while len(vals) < stage_batch_size:
+        while len(vals) < size:
             made_progress = False  # Flag to detect if we are stuck (shouldn't happen if initial len check passes)
             # Iterate through nodes that *might* still have items
             # Use a copy of the list as we might modify the underlying queues
@@ -875,9 +879,9 @@ class Queue:
             assert current_nodes_to_check, "No nodes to check"
 
             for node_id in current_nodes_to_check:
-                queue = self.by_node_id[node_id]
+                queue = self._by_node_id[node_id]
                 assert queue, "Queue is empty"
-                while queue and len(vals) < stage_batch_size:
+                while queue and len(vals) < size:
                     # Take one item
                     vals.append(queue.popleft())
                     node_ids_in_batch.append(node_id)
@@ -888,54 +892,73 @@ class Queue:
                     emptied_nodes.add(node_id)
 
                 # Check if batch is full *after adding* the item
-                if len(vals) == stage_batch_size:
+                if len(vals) == size:
                     break  # Exit the inner for loop immediately
 
             # If we went through all active nodes and didn't add anything, something is wrong
             if not made_progress:
                 # This indicates a potential logic error or race condition if len(self) changed concurrently
-                print(
-                    f"Warning: No progress made in filling batch. Current size: {len(vals)}, Target: {stage_batch_size}"
-                )
+                print(f"Warning: No progress made in filling batch. Current size: {len(vals)}, Target: {size}")
                 # Depending on requirements, you might return a partial batch or raise an error
-                # For now, we break, and the assertion below will likely fail if len(vals) != stage_batch_size
+                # For now, we break, and the assertion below will likely fail if len(vals) != size
                 break
 
         # If it fails, it implies not enough items were available despite the initial check,
         # or the loop logic has an issue.
-        assert len(vals) == stage_batch_size, f"Failed to collect exact batch size. Got {len(vals)}"
+        assert len(vals) == size, f"Failed to collect exact batch size. Got {len(vals)}"
         assert len(node_ids_in_batch) > 0, "No node IDs in batch"
         counts = collections.Counter(node_ids_in_batch)
         # Find the node ID that appeared most often in this specific batch
         most_common_node = counts.most_common(1)[0][0]
 
-        # Return the batch as a Task object
-        return actor_pool.Task(vals, most_common_node)
+        # Return the batch with its dominant origin node as a locality hint.
+        return Batch(vals, most_common_node)
 
-    def get_all_samples(self) -> list[ray.ObjectRef]:
-        """
-        Retrieves all currently held ObjectRefs from all node queues.
-
-        Note: This clears the queue. If you need to keep the items,
-              you should copy them first.
+    def drain(self) -> list[Any]:
+        """Remove and return all currently held handles, emptying the queue.
 
         Returns:
-            A list containing all ObjectRefs present in the queue.
+            A list containing all handles that were present in the queue.
         """
         all_refs = []
-        for node_id in list(self.by_node_id.keys()):  # Iterate over keys copy
-            queue = self.by_node_id[node_id]
+        for node_id in list(self._by_node_id.keys()):  # Iterate over keys copy
+            queue = self._by_node_id[node_id]
             all_refs.extend(list(queue))  # Add all items from the deque
             queue.clear()  # Clear the original deque
 
         # Clean up empty node entries
-        empty_nodes = [nid for nid, queue in self.by_node_id.items() if not queue]
+        empty_nodes = [nid for nid, queue in self._by_node_id.items() if not queue]
         for nid in empty_nodes:
-            del self.by_node_id[nid]
+            del self._by_node_id[nid]
         return all_refs
 
+    def ack(self, batch: Batch) -> None:
+        """No-op: reads are destructive, so there is nothing to confirm."""
+        del batch
 
-def _upstream_queue_lens(input_queue: Queue, queues: list[Queue], num_pools: int) -> list[int]:
+    def nack(self, batch: Batch) -> None:
+        """No-op: reads are destructive, so there is nothing to return."""
+        del batch
+
+
+class RayObjectStoreCodec:
+    """Default :class:`PayloadCodec` backed by the Ray object store.
+
+    ``encode`` puts a sample into the object store and returns its
+    ``ray.ObjectRef``; ``decode`` resolves a ref back to the real sample. This
+    keeps payloads in Ray's zero-copy shared memory. A persistent backend would
+    swap this for a codec that writes to / reads from durable storage and lets
+    queue handles be storage keys instead of object refs.
+    """
+
+    def encode(self, sample: Any) -> Any:
+        return ray.put(sample)
+
+    def decode(self, handle: Any) -> Any:
+        return ray.get(handle)
+
+
+def _upstream_queue_lens(input_queue: StageQueue, queues: list[StageQueue], num_pools: int) -> list[int]:
     """Return each stage's upstream queue length, in input samples.
 
     Stage 0 draws from the pipeline ``input_queue``; every downstream stage
@@ -973,12 +996,24 @@ def run_pipeline(
     # This needs to be shared between all actor pools as multiple pools could be utilizing the same node.
     port_registry = actor_pool.ClusterPortRegistry()
 
-    input_queue = Queue()
-    input_queue.by_node_id[None].extend(pipeline_spec.input_data)
+    # Resolve the pluggable queue/payload backends from config, falling back to
+    # the in-memory + Ray-object-store defaults. The scheduler below is agnostic
+    # to which backend it got.
+    mode_specific = pipeline_spec.config.mode_specific
+    queue_factory = mode_specific.queue_factory or InMemoryStageQueue
+    payload_codec_factory = mode_specific.payload_codec_factory or RayObjectStoreCodec
+
+    # Materialisation boundary between real samples and queue handles. Defaults
+    # to the Ray object store; swap for a durable codec to persist payloads.
+    payload_codec: PayloadCodec = payload_codec_factory()
+
+    input_queue: StageQueue = queue_factory()
+    # Seed stage 0's input with the offline input data (origin node unknown).
+    input_queue.put(Batch(list(pipeline_spec.input_data), None))
     del pipeline_spec.input_data
     initital_input_length = len(input_queue)
 
-    queues = [Queue() for _ in pipeline_spec.stages]
+    queues: list[StageQueue] = [queue_factory() for _ in pipeline_spec.stages]
     # Create a actor pool for each stage.
     pools: list[actor_pool.ActorPool] = []
     for idx, stage in enumerate(pipeline_spec.stages):
@@ -1096,7 +1131,7 @@ def run_pipeline(
                 except python_queue.Empty:
                     pass
                 else:
-                    input_queue.by_node_id[None].append(new_task)
+                    input_queue.put(Batch([new_task], None))
 
             # Add tasks if needed and able.
             # Start from the back and
@@ -1114,16 +1149,20 @@ def run_pipeline(
                         # fetch the actual data and push to the sink; block until the sink can accept the results.
                         for task in completed_tasks:
                             for data_ref in task.task_data:
-                                pipeline_spec.serving_queues.sink.put(ray.get(data_ref), block=True, timeout=None)
+                                pipeline_spec.serving_queues.sink.put(
+                                    payload_codec.decode(data_ref), block=True, timeout=None
+                                )
                     elif pipeline_spec.config.return_last_stage_outputs:
                         # Add to the output_queue for final return.
-                        [output_queue.add_task(x) for x in completed_tasks]
+                        for task in completed_tasks:
+                            output_queue.put(Batch(task.task_data, task.origin_node_id))
                     else:
                         # If the last stage and the user did not ask for the results, we don't need to queue them.
                         pass
                 else:
                     # pass to the next stage
-                    [output_queue.add_task(x) for x in completed_tasks]
+                    for task in completed_tasks:
+                        output_queue.put(Batch(task.task_data, task.origin_node_id))
 
                 while True:
                     # Deal with backpressure. We want to make sure that we have enough tasks to keep this stage busy,
@@ -1134,7 +1173,7 @@ def run_pipeline(
                     # We adapt this slightly for the case where track samples directly by taking into account the
                     # average number of samples per task.
                     num_tasks_in_progress = pool.num_used_slots + len(pool._task_queue)
-                    avg_samples_per_task = output_queue.avg_samples_per_task()
+                    avg_samples_per_task = output_queue.avg_samples_per_batch()
                     if is_last_stage or avg_samples_per_task is None or avg_samples_per_task == 0:
                         num_tasks_completed = 0
                     else:
@@ -1159,28 +1198,30 @@ def run_pipeline(
                     queue_to_pull_from = input_queue if idx == 0 else queues[idx - 1]
                     if not queue_to_pull_from:
                         break
-                    # Get the next task to add to the pool.
-                    maybe_task = queue_to_pull_from.maybe_get_batch(stage_batch_size)
+                    # Get the next batch to add to the pool.
+                    maybe_batch = queue_to_pull_from.try_get_batch(stage_batch_size)
                     if is_first_stage:  # Special case the first stage because we need to pull from input_queue.
-                        if maybe_task is None:  # If there is some "remainder" in the input queue, add it.
-                            task = queue_to_pull_from.maybe_get_batch(len(queue_to_pull_from))
-                        elif maybe_task is None:  # There are not enough samples to fill the batch.
-                            break
+                        if maybe_batch is None:  # If there is some "remainder" in the input queue, add it.
+                            batch = queue_to_pull_from.try_get_batch(len(queue_to_pull_from))
                         else:
-                            task = maybe_task
-                        logger.trace(f"Stage {idx} adding task: {task}")
-                        pool.add_task(actor_pool.Task([ray.put(x) for x in task.task_data], None))
+                            batch = maybe_batch
+                        assert batch is not None
+                        logger.trace(f"Stage {idx} adding batch: {batch}")
+                        # First stage holds raw samples; materialise them into the payload store.
+                        pool.add_task(actor_pool.Task([payload_codec.encode(x) for x in batch.items], None))
                     else:
                         if (
-                            maybe_task is None and stage_is_dones[idx - 1]
+                            maybe_batch is None and stage_is_dones[idx - 1]
                         ):  # If the last stage is done, and there is some "remainder" in the input queue, add it.
-                            task = queue_to_pull_from.maybe_get_batch(len(queue_to_pull_from))
-                        elif maybe_task is None:  # There are not enough samples to fill the batch.
+                            batch = queue_to_pull_from.try_get_batch(len(queue_to_pull_from))
+                        elif maybe_batch is None:  # There are not enough samples to fill the batch.
                             break
                         else:
-                            task = maybe_task
-                        logger.trace(f"Stage {idx} adding task: {task}")
-                        pool.add_task(task)  # type: ignore
+                            batch = maybe_batch
+                        assert batch is not None
+                        logger.trace(f"Stage {idx} adding batch: {batch}")
+                        # Downstream batches already hold object-store handles.
+                        pool.add_task(actor_pool.Task(batch.items, batch.origin_node_id))
 
             # Runtime-aware schedulers (SATURATION_AWARE) submit here, after the
             # reverse stage loop above has transferred completed tasks downstream
@@ -1230,6 +1271,6 @@ def run_pipeline(
             logger.trace(last_stats.to_log_string())
 
     if pipeline_spec.config.return_last_stage_outputs:
-        return ray.get(queues[-1].get_all_samples())
+        return [payload_codec.decode(handle) for handle in queues[-1].drain()]
     else:
         return None

@@ -31,6 +31,7 @@ from loguru import logger as loguru_logger
 
 import cosmos_xenna.pipelines.v1 as v1
 from cosmos_xenna.pipelines.private import allocator, data_structures, resources, streaming
+from cosmos_xenna.pipelines.private.queue_interface import Batch
 from cosmos_xenna.pipelines.private.autoscaling_algorithms import FragmentationBasedAutoscaler
 from cosmos_xenna.pipelines.private.scheduling_py.runtime_signals import RuntimeSignals
 from cosmos_xenna.pipelines.private.scheduling_py.saturation_aware.capacity import CapacityPlan, StageCapacity
@@ -529,11 +530,11 @@ def test_saturation_aware_uses_its_own_interval() -> None:
 
 def test_upstream_queue_lens_reads_input_then_prior_stage_queues() -> None:
     """Stage 0 reads the pipeline input queue; each later stage reads its upstream output queue."""
-    input_queue = streaming.Queue()
-    input_queue.by_node_id[None].extend([_mock_object_ref() for _ in range(3)])  # 3 source items
-    stage0_out = streaming.Queue()
-    stage0_out.by_node_id[None].append(_mock_object_ref())  # 1 item waiting to feed stage 1
-    queues = [stage0_out, streaming.Queue()]
+    input_queue = streaming.InMemoryStageQueue()
+    input_queue.put(Batch([_mock_object_ref() for _ in range(3)], None))  # 3 source items
+    stage0_out = streaming.InMemoryStageQueue()
+    stage0_out.put(Batch([_mock_object_ref()], None))  # 1 item waiting to feed stage 1
+    queues: list[streaming.StageQueue] = [stage0_out, streaming.InMemoryStageQueue()]
     # idx 0 -> len(input_queue) == 3; idx 1 -> len(queues[0]) == 1.
     assert streaming._upstream_queue_lens(input_queue, queues, 2) == [3, 1]
 
