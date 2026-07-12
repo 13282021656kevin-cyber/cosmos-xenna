@@ -1,0 +1,4 @@
+[env]
+# 强制 pyo3 使用系统 Python 3.12(满足 abi3-py312 的最低版本要求)
+# 否则会默认探测到 PATH 中的 anaconda Python 3.6 而编译失败
+PYO3_PYTHON = "/usr/bin/python3.12"
