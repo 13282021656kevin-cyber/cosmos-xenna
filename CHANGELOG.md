@@ -2,6 +2,24 @@
 
 ## Latest
 
+## [0.5.5]
+
+### Fixed
+
+- `ActorPool.stop()` skips the graceful drain and user `destroy()` for actors still in setup, avoiding a race with the in-flight `setup()` that surfaced as spurious `Engine core initialization failed` tracebacks. Those actors are torn down via `ray.kill()` plus the node-local pid reap.
+
+## [0.5.4]
+
+### Changed
+
+- Bumped Rust extension dependencies to clear `cargo-audit` advisories, including `object_store` (0.10 → 0.14) and `pyo3` (0.25 → 0.29), and updated the native bindings for their API changes. No public Python API changes.
+
+## [0.5.3]
+
+### Changed
+
+- `ActorPool.stop()` tears actors down in parallel via a bounded thread pool, so shutdown wall time scales with the slowest actor's teardown rather than the sum across actors. The mid-pipeline autoscaler kill path is unchanged.
+
 ## [0.5.2]
 
 ### Released

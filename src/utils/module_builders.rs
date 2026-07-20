@@ -33,7 +33,7 @@ use std::ffi::CString;
 /// use pyo3::wrap_pyfunction;
 ///
 /// fn example_usage() -> PyResult<()> {
-///     Python::with_gil(|py| {
+///     Python::attach(|py| {
 ///         let m = PyModule::new(py, "my_module")?;
 ///         let my_module = ImportablePyModuleBuilder::new(py, "my_package.my_module")?
 ///             .add_function(wrap_pyfunction!(my_function, m)?)?
@@ -75,7 +75,7 @@ impl<'py> ImportablePyModuleBuilder<'py> {
 
             // Create a bound reference and downcast
             let bound = Bound::from_borrowed_ptr(py, ptr);
-            bound.downcast_into::<PyModule>()?
+            bound.cast_into::<PyModule>()?
         };
 
         // Initialize basic module attributes
@@ -146,7 +146,7 @@ impl<'py> ImportablePyModuleBuilder<'py> {
 
         // Update the __module__ attribute to the correct module name
         let py = self.inner.py();
-        let type_object = T::lazy_type_object().get_or_init(py);
+        let type_object = T::lazy_type_object().get_or_try_init(py)?;
 
         // Only override the __module__ if it's set to "builtins" (default)
         let current_module = type_object.getattr("__module__")?.extract::<String>()?;
