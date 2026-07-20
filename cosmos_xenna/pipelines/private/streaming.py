@@ -40,7 +40,7 @@ from cosmos_xenna.pipelines.private import (
 from cosmos_xenna.pipelines.private.scheduling_py import runtime_signals
 from cosmos_xenna.pipelines.private.scheduling_py.saturation_aware.config import SaturationAwareConfig
 from cosmos_xenna.pipelines.private.scheduling_py.saturation_aware.scheduler import SaturationAwareScheduler
-from cosmos_xenna.ray_utils import actor_pool, stage_worker
+from cosmos_xenna.ray_utils import actor_pool, object_owner, stage_worker
 from cosmos_xenna.utils import approx, deque, timing, verbosity
 from cosmos_xenna.utils import python_log as logger
 
@@ -964,7 +964,26 @@ def run_pipeline(
     """Runs a pipeline under STREAMING mode.
 
     This is the most complex pipeline mode we have. See README.md for more info about what streaming mode does.
+
+    Wraps the executor loop in a pipeline-scoped ObjectOwner lifetime (opt-in via
+    ``SPLIT_FIELD_ENV_VAR``). The owner is created before any stage worker starts
+    and destroyed only after the final outputs have been collected, so
+    owner-assigned Plasma objects (see ``object_owner``) survive individual
+    worker teardown for the entire pipeline. BATCH mode does not create an owner,
+    so split-field transport naturally no-ops there.
     """
+    owner_handle = object_owner.create_object_owner() if object_owner.split_field_enabled() else None
+    try:
+        return _run_pipeline_inner(pipeline_spec, cluster_resources)
+    finally:
+        object_owner.destroy_object_owner(owner_handle)
+
+
+def _run_pipeline_inner(
+    pipeline_spec: specs.PipelineSpec,
+    cluster_resources: resources.ClusterResources,
+) -> Optional[list]:
+    """Streaming executor body. See :func:`run_pipeline` for owner-lifetime wrapping."""
     _verify_enough_resources(pipeline_spec, cluster_resources)
     assert isinstance(pipeline_spec.config.mode_specific, specs.StreamingSpecificSpec)
     # Create a worker allocator to keep track of which workers are allocated across the cluster
